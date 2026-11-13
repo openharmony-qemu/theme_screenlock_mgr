@@ -105,6 +105,27 @@ enum class Action : uint8_t {
     UNLOCKSCREEN,
 };
 
+// Shared native values: moving the definition from the service header keeps
+// the existing numeric ABI while allowing the NAPI boundary to use it safely.
+enum class AuthState : int32_t {
+    UNAUTH = 0,
+    PRE_AUTHED_BY_CREDENTIAL = 1,
+    PRE_AUTHED_BY_FINGERPRINT = 2,
+    PRE_AUTHED_BY_FACE = 3,
+    AUTHED_BY_CREDENTIAL = 4,
+    AUTHED_BY_FINGERPRINT = 5,
+    AUTHED_BY_FACE = 6,
+    PRE_AUTHED_RESULT_BY_CREDENTIAL = 7,
+    PRE_AUTHED_RESULT_BY_FINGERPRINT = 8,
+    PRE_AUTHED_RESULT_BY_FACE = 9,
+};
+
+enum class UnlockPolicy : int32_t {
+    DEFAULT = 0,
+    EXTENDED_AUTH_ONLY = 1,
+    EXTENDED_AUTH_AND_SYSTEM = 2,
+};
+
 enum class StrongAuthReasonFlags : int32_t {
     NONE = 0x00000000,
     AFTER_BOOT = 0x00000001,

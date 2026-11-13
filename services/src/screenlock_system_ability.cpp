@@ -14,7 +14,10 @@
  */
 #include "screenlock_system_ability.h"
 
+#include <atomic>
 #include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <fcntl.h>
 #include <functional>
@@ -35,6 +38,7 @@
 #include "iservice_registry.h"
 #include "os_account_manager.h"
 #include "parameter.h"
+#include "power_mgr_client.h"
 #include "sclock_log.h"
 #include "screenlock_common.h"
 #include "screenlock_get_info_callback.h"
@@ -81,7 +85,112 @@ std::mutex ScreenLockSystemAbility::instanceLock_;
 std::mutex ScreenLockSystemAbility::queueLock_;
 sptr<ScreenLockSystemAbility> ScreenLockSystemAbility::instance_;
 constexpr int32_t MAX_RETRY_TIMES = 20;
+constexpr std::int64_t VIRT_BOOT_UNLOCK_DELAY_US = 300000L;
+constexpr std::int64_t VIRT_BOOT_UNLOCK_RETRY_DELAY_US = 2500000L;
+constexpr std::int64_t VIRT_POST_UNLOCK_WAKE_DELAY_US = 1500000L;
+constexpr int32_t VIRT_BOOT_UNLOCK_MAX_ATTEMPTS = 60;
+constexpr int32_t VIRT_BOOT_FALLBACK_UNLOCK_ATTEMPT = 6;
 std::shared_ptr<ffrt::queue> ScreenLockSystemAbility::queue_;
+static std::atomic<bool> g_explicitLockRequested{false};
+static std::atomic<bool> g_initialBootLockSeen{false};
+static std::atomic<bool> g_initialBootUnlockDone{false};
+static std::atomic<bool> g_virtUnlockDispatched{false};
+static std::atomic<bool> g_virtSleeping{false};
+static std::atomic<std::uint64_t> g_virtUnlockGeneration{0};
+
+static bool IsVirtBootHardware()
+{
+    char value[32] = {0};
+    if (GetParameter("ohos.boot.hardware", "", value, sizeof(value)) > 0) {
+        return strcmp(value, "virt") == 0;
+    }
+    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char cmdline[1024] = {0};
+    ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+    close(fd);
+    return (n > 0) && (strstr(cmdline, "ohos.boot.hardware=virt") != nullptr);
+}
+
+static void SubmitVirtQueueTask(std::mutex &queueLock, std::shared_ptr<ffrt::queue> &queue,
+    const std::function<void()> &task, std::int64_t delayUs)
+{
+    std::lock_guard<std::mutex> autoLock(queueLock);
+    if (queue != nullptr) {
+        queue->submit(task, ffrt::task_attr().delay(delayUs));
+    }
+}
+
+static void WakeVirtDisplayIfNeeded(const char *reasonDetail)
+{
+    if (g_explicitLockRequested.load()) {
+        return;
+    }
+    if (g_initialBootUnlockDone.load() && g_virtSleeping.load()) {
+        return;
+    }
+    auto &powerClient = PowerMgr::PowerMgrClient::GetInstance();
+    powerClient.RestoreScreenOffTime();
+    if (powerClient.GetState() != PowerMgr::PowerState::AWAKE || !powerClient.IsScreenOn(false)) {
+        SCLOCK_HILOGI("virt auto-unlock keeping display awake (%{public}s)", reasonDetail);
+        powerClient.WakeupDevice(
+            PowerMgr::WakeupDeviceType::WAKEUP_DEVICE_APPLICATION, std::string(reasonDetail));
+    }
+}
+
+static void ScheduleVirtAutoUnlock(const wptr<ScreenLockSystemAbility> &weakSelf,
+    std::mutex &queueLock, std::shared_ptr<ffrt::queue> &queue,
+    const std::function<void(const sptr<ScreenLockSystemAbility> &)> &dispatchUnlock,
+    bool keepDisplayAwake, std::int64_t initialDelayUs)
+{
+    if (!IsVirtBootHardware() || g_explicitLockRequested.load()) {
+        return;
+    }
+    if (g_initialBootUnlockDone.load() && g_virtSleeping.load()) {
+        return;
+    }
+    const std::uint64_t gen = g_virtUnlockGeneration.fetch_add(1) + 1;
+    auto runner = std::make_shared<std::function<void(int32_t)>>();
+    *runner = [weakSelf, &queueLock, &queue, dispatchUnlock, keepDisplayAwake, gen, runner](int32_t attempt) {
+        if (g_virtUnlockGeneration.load() != gen || g_explicitLockRequested.load()) {
+            return;
+        }
+        if (g_initialBootUnlockDone.load() && g_virtSleeping.load()) {
+            return;
+        }
+        sptr<ScreenLockSystemAbility> self = weakSelf.promote();
+        if (self == nullptr) {
+            return;
+        }
+        if (self->GetSecure()) {
+            SCLOCK_HILOGI("virt auto-unlock skipped because user credential is set");
+            return;
+        }
+        if (keepDisplayAwake) {
+            WakeVirtDisplayIfNeeded("virt_boot_unlock");
+        }
+        const bool initialDone = g_initialBootUnlockDone.load();
+        if (initialDone && !self->IsScreenLocked() && attempt >= VIRT_BOOT_FALLBACK_UNLOCK_ATTEMPT) {
+            return;
+        }
+        const bool shouldSendUnlock = initialDone || g_initialBootLockSeen.load() ||
+            (attempt >= VIRT_BOOT_FALLBACK_UNLOCK_ATTEMPT && self->IsScreenLocked());
+        if (shouldSendUnlock && (!initialDone || self->IsScreenLocked())) {
+            g_virtUnlockDispatched.store(true);
+            SCLOCK_HILOGI("virt auto-unlocking screen (initialDone=%{public}d, attempt=%{public}d)",
+                static_cast<int>(initialDone), attempt);
+            dispatchUnlock(self);
+        }
+        if (attempt + 1 < VIRT_BOOT_UNLOCK_MAX_ATTEMPTS &&
+            g_virtUnlockGeneration.load() == gen && !g_explicitLockRequested.load()) {
+            SubmitVirtQueueTask(queueLock, queue,
+                [runner, attempt]() { (*runner)(attempt + 1); }, VIRT_BOOT_UNLOCK_RETRY_DELAY_US);
+        }
+    };
+    SubmitVirtQueueTask(queueLock, queue, [runner]() { (*runner)(0); }, initialDelayUs);
+}
 
 static int32_t GetCurrentActiveOsAccountId()
 {
@@ -460,6 +569,10 @@ void ScreenLockSystemAbility::OnScreenOff(EventStatus status)
 {
     SystemEvent systemEvent(BEGIN_SCREEN_OFF);
     if (status == EventStatus::BEGIN) {
+        if (g_initialBootUnlockDone.load()) {
+            g_virtSleeping.store(true);
+            g_virtUnlockGeneration.fetch_add(1);
+        }
         stateValue_.SetScreenState(static_cast<int32_t>(ScreenState::SCREEN_STATE_BEGIN_OFF));
     } else if (status == EventStatus::END) {
         stateValue_.SetScreenState(static_cast<int32_t>(ScreenState::SCREEN_STATE_END_OFF));
@@ -470,6 +583,7 @@ void ScreenLockSystemAbility::OnScreenOff(EventStatus status)
 
 void ScreenLockSystemAbility::OnScreenOn(EventStatus status)
 {
+    g_virtSleeping.store(false);
     SystemEvent systemEvent(BEGIN_SCREEN_ON);
     if (status == EventStatus::BEGIN) {
         stateValue_.SetScreenState(static_cast<int32_t>(ScreenState::SCREEN_STATE_BEGIN_ON));
@@ -478,6 +592,14 @@ void ScreenLockSystemAbility::OnScreenOn(EventStatus status)
         systemEvent.eventType_ = END_SCREEN_ON;
     }
     SystemEventCallBack(systemEvent);
+    if (g_initialBootUnlockDone.load() && !g_explicitLockRequested.load()) {
+        auto dispatchUnlock = [](const sptr<ScreenLockSystemAbility> &target) {
+            SystemEvent unlockEvent(UNLOCKSCREEN);
+            target->SystemEventCallBack(unlockEvent, HITRACE_UNLOCKSCREEN);
+        };
+        ScheduleVirtAutoUnlock(wptr<ScreenLockSystemAbility>(this), queueLock_, queue_,
+            dispatchUnlock, true, VIRT_BOOT_UNLOCK_DELAY_US);
+    }
 }
 
 void ScreenLockSystemAbility::OnSystemReady()
@@ -494,6 +616,14 @@ void ScreenLockSystemAbility::OnSystemReady()
             systemEventListener_->OnCallBack(systemEvent);
             isExitFlag = true;
             listenerMutex_.unlock();
+            if (!g_initialBootUnlockDone.load() && !g_explicitLockRequested.load()) {
+                auto dispatchUnlock = [](const sptr<ScreenLockSystemAbility> &target) {
+                    SystemEvent unlockEvent(UNLOCKSCREEN);
+                    target->SystemEventCallBack(unlockEvent, HITRACE_UNLOCKSCREEN);
+                };
+                ScheduleVirtAutoUnlock(wptr<ScreenLockSystemAbility>(this), queueLock_, queue_,
+                    dispatchUnlock, true, VIRT_BOOT_UNLOCK_RETRY_DELAY_US);
+            }
         } else {
             listenerMutex_.unlock();
             SCLOCK_HILOGE("ScreenLockSystemAbility OnSystemReady type not found., tryTime = %{public}d", tryTime);
@@ -505,6 +635,7 @@ void ScreenLockSystemAbility::OnSystemReady()
 
 void ScreenLockSystemAbility::OnWakeUp(EventStatus status)
 {
+    g_virtSleeping.store(false);
     SystemEvent systemEvent(BEGIN_WAKEUP);
     if (status == EventStatus::BEGIN) {
         stateValue_.SetInteractiveState(static_cast<int32_t>(InteractiveState::INTERACTIVE_STATE_BEGIN_WAKEUP));
@@ -513,12 +644,24 @@ void ScreenLockSystemAbility::OnWakeUp(EventStatus status)
         systemEvent.eventType_ = END_WAKEUP;
     }
     SystemEventCallBack(systemEvent);
+    if (g_initialBootUnlockDone.load() && !g_explicitLockRequested.load()) {
+        auto dispatchUnlock = [](const sptr<ScreenLockSystemAbility> &target) {
+            SystemEvent unlockEvent(UNLOCKSCREEN);
+            target->SystemEventCallBack(unlockEvent, HITRACE_UNLOCKSCREEN);
+        };
+        ScheduleVirtAutoUnlock(wptr<ScreenLockSystemAbility>(this), queueLock_, queue_,
+            dispatchUnlock, true, VIRT_BOOT_UNLOCK_DELAY_US);
+    }
 }
 
 void ScreenLockSystemAbility::OnSleep(EventStatus status)
 {
     SystemEvent systemEvent(BEGIN_SLEEP);
     if (status == EventStatus::BEGIN) {
+        if (g_initialBootUnlockDone.load()) {
+            g_virtSleeping.store(true);
+            g_virtUnlockGeneration.fetch_add(1);
+        }
         stateValue_.SetInteractiveState(static_cast<int32_t>(InteractiveState::INTERACTIVE_STATE_BEGIN_SLEEP));
     } else if (status == EventStatus::END) {
         stateValue_.SetInteractiveState(static_cast<int32_t>(InteractiveState::INTERACTIVE_STATE_END_SLEEP));
@@ -603,6 +746,15 @@ int32_t ScreenLockSystemAbility::UnlockInner(const sptr<ScreenLockCallbackInterf
     unlockListenerMutex_.unlock();
     SystemEvent systemEvent(UNLOCKSCREEN);
     SystemEventCallBack(systemEvent, HITRACE_UNLOCKSCREEN);
+    if (IsVirtBootHardware() && !g_explicitLockRequested.load()) {
+        g_virtSleeping.store(false);
+        auto dispatchUnlock = [](const sptr<ScreenLockSystemAbility> &target) {
+            SystemEvent unlockEvent(UNLOCKSCREEN);
+            target->SystemEventCallBack(unlockEvent, HITRACE_UNLOCKSCREEN);
+        };
+        ScheduleVirtAutoUnlock(wptr<ScreenLockSystemAbility>(this), queueLock_, queue_,
+            dispatchUnlock, true, VIRT_BOOT_UNLOCK_RETRY_DELAY_US);
+    }
     FinishAsyncTrace(HITRACE_TAG_MISC, "UnlockScreen end", HITRACE_UNLOCKSCREEN);
     return E_SCREENLOCK_OK;
 }
@@ -620,6 +772,8 @@ int32_t ScreenLockSystemAbility::Lock(const sptr<ScreenLockCallbackInterface> &l
         SCLOCK_HILOGI("Currently in a locked screen state");
     }
     printCallerPid("Lock listener");
+    g_explicitLockRequested.store(true);
+    g_virtUnlockGeneration.fetch_add(1);
     lockListenerMutex_.lock();
     lockVecListeners_.push_back(listener);
     lockListenerMutex_.unlock();
@@ -638,6 +792,8 @@ int32_t ScreenLockSystemAbility::Lock(int32_t userId)
         SCLOCK_HILOGI("Currently in a locked screen state");
     }
     printCallerPid("Lock userId");
+    g_explicitLockRequested.store(true);
+    g_virtUnlockGeneration.fetch_add(1);
     SystemEvent systemEvent(LOCKSCREEN);
     SystemEventCallBack(systemEvent, HITRACE_LOCKSCREEN);
     return E_SCREENLOCK_OK;
@@ -1085,32 +1241,80 @@ void ScreenLockSystemAbility::LockScreenEvent(int stateResult)
         userId = GetUserIdFromCallingUid();
         SetScreenlocked(true, userId);
     }
-    std::lock_guard<std::mutex> autoLock(lockListenerMutex_);
-    if (lockVecListeners_.size()) {
-        auto callback = [this, stateResult]() {
-            std::lock_guard<std::mutex> guard(lockListenerMutex_);
-            for (size_t i = 0; i < lockVecListeners_.size(); i++) {
-                lockVecListeners_[i]->OnCallBack(stateResult);
-            }
-            lockVecListeners_.clear();
-        };
-        ffrt::submit(callback);
+    bool hadLockListeners = false;
+    {
+        std::lock_guard<std::mutex> autoLock(lockListenerMutex_);
+        hadLockListeners = !lockVecListeners_.empty();
+        if (hadLockListeners) {
+            auto callback = [this, stateResult]() {
+                std::lock_guard<std::mutex> guard(lockListenerMutex_);
+                for (size_t i = 0; i < lockVecListeners_.size(); i++) {
+                    lockVecListeners_[i]->OnCallBack(stateResult);
+                }
+                lockVecListeners_.clear();
+            };
+            ffrt::submit(callback);
+        }
+        if (stateResult == ScreenChange::SCREEN_SUCC) {
+            PublishEvent(EventFwk::CommonEventSupport::COMMON_EVENT_SCREEN_LOCKED, userId);
+        }
     }
-    if (stateResult == ScreenChange::SCREEN_SUCC) {
-        PublishEvent(EventFwk::CommonEventSupport::COMMON_EVENT_SCREEN_LOCKED, userId);
+    if (stateResult == ScreenChange::SCREEN_SUCC && !hadLockListeners &&
+        !g_explicitLockRequested.load() && IsVirtBootHardware()) {
+        g_initialBootLockSeen.store(true);
+        if (!g_initialBootUnlockDone.load() || !g_virtSleeping.load()) {
+            auto dispatchUnlock = [](const sptr<ScreenLockSystemAbility> &target) {
+                SystemEvent unlockEvent(UNLOCKSCREEN);
+                target->SystemEventCallBack(unlockEvent, HITRACE_UNLOCKSCREEN);
+            };
+            ScheduleVirtAutoUnlock(wptr<ScreenLockSystemAbility>(this), queueLock_, queue_,
+                dispatchUnlock, true, VIRT_BOOT_UNLOCK_DELAY_US);
+        }
     }
 }
 
 void ScreenLockSystemAbility::UnlockScreenEvent(int stateResult)
 {
     SCLOCK_HILOGD("ScreenLockSystemAbility UnlockScreenEvent stateResult:%{public}d", stateResult);
+    auto finishVirtUnlock = [this]() {
+        if (!IsVirtBootHardware() || g_explicitLockRequested.load()) {
+            return;
+        }
+        const bool wasInitialBoot = !g_initialBootUnlockDone.exchange(true);
+        const std::uint64_t settleGen = g_virtUnlockGeneration.fetch_add(1) + 1;
+        if (wasInitialBoot || !g_virtSleeping.load()) {
+            SubmitVirtQueueTask(queueLock_, queue_, [settleGen]() {
+                if (g_virtUnlockGeneration.load() != settleGen || g_explicitLockRequested.load()) {
+                    return;
+                }
+                WakeVirtDisplayIfNeeded("virt_unlock_complete");
+            }, 0);
+            SubmitVirtQueueTask(queueLock_, queue_, [settleGen]() {
+                if (g_virtUnlockGeneration.load() != settleGen || g_explicitLockRequested.load()) {
+                    return;
+                }
+                WakeVirtDisplayIfNeeded("virt_unlock_settle");
+            }, VIRT_POST_UNLOCK_WAKE_DELAY_US);
+        }
+    };
     if (stateResult == ScreenChange::ALREADY_UNLOCKED) {
+        if (IsVirtBootHardware() && (g_virtUnlockDispatched.load() ||
+            g_initialBootLockSeen.load() || g_initialBootUnlockDone.load())) {
+            int32_t userId = GetUserIdFromCallingUid();
+            SetScreenlocked(false, userId);
+            finishVirtUnlock();
+        }
         NotifyUnlockListener(ScreenChange::SCREEN_SUCC);
         return;
     }
     if (stateResult == ScreenChange::EARLY_SUCCESS) {
         int32_t userId = GetUserIdFromCallingUid();
         SetScreenlocked(false, userId);
+        if (IsVirtBootHardware() && !g_explicitLockRequested.load()) {
+            NotifyDisplayEvent(DisplayEvent::UNLOCK);
+            finishVirtUnlock();
+            NotifyUnlockListener(ScreenChange::SCREEN_SUCC);
+        }
         PublishEvent(EventFwk::CommonEventSupport::COMMON_EVENT_SCREEN_LOCK_EXITING, userId);
         return;
     }
@@ -1119,6 +1323,7 @@ void ScreenLockSystemAbility::UnlockScreenEvent(int stateResult)
         SetScreenlocked(false, userId);
         NotifyDisplayEvent(DisplayEvent::UNLOCK);
         PublishEvent(EventFwk::CommonEventSupport::COMMON_EVENT_SCREEN_UNLOCKED, userId);
+        finishVirtUnlock();
     }
 
     if (stateResult != ScreenChange::SCREEN_FAIL) {

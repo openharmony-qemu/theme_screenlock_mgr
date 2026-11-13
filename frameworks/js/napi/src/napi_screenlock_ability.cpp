@@ -64,6 +64,68 @@ const std::map<uint32_t, std::string> ERROR_INFO_MAP = {
     { JsErrorCode::ERR_USER_ID_INVALID, USER_ID_INVALID },
 };
 
+struct PublicScreenLockEnumMember {
+    const char *name;
+    int32_t value;
+};
+
+template<size_t Count>
+static napi_status RegisterPublicScreenLockEnum(napi_env env, napi_value exports, const char *name,
+    const PublicScreenLockEnumMember (&members)[Count])
+{
+    napi_value enumeration = nullptr;
+    napi_status status = napi_create_object(env, &enumeration);
+    if (status != napi_ok) {
+        return status;
+    }
+    for (const auto &member : members) {
+        napi_value value = nullptr;
+        status = napi_create_int32(env, member.value, &value);
+        if (status != napi_ok) {
+            return status;
+        }
+        status = napi_set_named_property(env, enumeration, member.name, value);
+        if (status != napi_ok) {
+            return status;
+        }
+    }
+    return napi_set_named_property(env, exports, name, enumeration);
+}
+
+static napi_status RegisterPublicScreenLockEnums(napi_env env, napi_value exports)
+{
+    const PublicScreenLockEnumMember strong[] = {
+        {"NONE", static_cast<int32_t>(StrongAuthReasonFlags::NONE)},
+        {"AFTER_BOOT", static_cast<int32_t>(StrongAuthReasonFlags::AFTER_BOOT)},
+        {"AFTER_TIMEOUT", static_cast<int32_t>(StrongAuthReasonFlags::AFTER_TIMEOUT)},
+        {"ACTIVE_REQUEST", static_cast<int32_t>(StrongAuthReasonFlags::ACTIVE_REQUEST)},
+        {"POLICY_RESTRICTION", static_cast<int32_t>(StrongAuthReasonFlags::DPM_RESTRICT)},
+    };
+    const PublicScreenLockEnumMember auth[] = {
+        {"NOT_AUTHED", static_cast<int32_t>(AuthState::UNAUTH)},
+        {"PRE_AUTHED_BY_CREDENTIAL", static_cast<int32_t>(AuthState::PRE_AUTHED_BY_CREDENTIAL)},
+        {"PRE_AUTHED_BY_FINGERPRINT", static_cast<int32_t>(AuthState::PRE_AUTHED_BY_FINGERPRINT)},
+        {"PRE_AUTHED_BY_FACE", static_cast<int32_t>(AuthState::PRE_AUTHED_BY_FACE)},
+        {"AUTHED_BY_CREDENTIAL", static_cast<int32_t>(AuthState::AUTHED_BY_CREDENTIAL)},
+        {"AUTHED_BY_FINGERPRINT", static_cast<int32_t>(AuthState::AUTHED_BY_FINGERPRINT)},
+        {"AUTHED_BY_FACE", static_cast<int32_t>(AuthState::AUTHED_BY_FACE)},
+    };
+    const PublicScreenLockEnumMember policy[] = {
+        {"DEFAULT", static_cast<int32_t>(UnlockPolicy::DEFAULT)},
+        {"EXTENDED_AUTH_ONLY", static_cast<int32_t>(UnlockPolicy::EXTENDED_AUTH_ONLY)},
+        {"EXTENDED_AUTH_AND_SYSTEM", static_cast<int32_t>(UnlockPolicy::EXTENDED_AUTH_AND_SYSTEM)},
+    };
+    napi_status status = RegisterPublicScreenLockEnum(env, exports, "StrongAuthReasonFlags", strong);
+    if (status != napi_ok) {
+        return status;
+    }
+    status = RegisterPublicScreenLockEnum(env, exports, "AuthState", auth);
+    if (status != napi_ok) {
+        return status;
+    }
+    return RegisterPublicScreenLockEnum(env, exports, "UnlockPolicy", policy);
+}
+
 napi_status Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor exportFuncs[] = {
@@ -84,8 +146,11 @@ napi_status Init(napi_env env, napi_value exports)
         DECLARE_NAPI_FUNCTION("isDeviceLocked", OHOS::ScreenLock::NAPI_IsDeviceLocked),
         DECLARE_NAPI_FUNCTION("getUnlockPolicy", OHOS::ScreenLock::NAPI_GetUnlockPolicy),
     };
-    napi_define_properties(env, exports, sizeof(exportFuncs) / sizeof(*exportFuncs), exportFuncs);
-    return napi_ok;
+    napi_status status = napi_define_properties(env, exports, sizeof(exportFuncs) / sizeof(*exportFuncs), exportFuncs);
+    if (status != napi_ok) {
+        return status;
+    }
+    return RegisterPublicScreenLockEnums(env, exports);
 }
 
 napi_status IsValidEvent(const std::string &type)
@@ -838,6 +903,7 @@ static napi_value ScreenlockInit(napi_env env, napi_value exports)
     napi_status ret = Init(env, exports);
     if (ret != napi_ok) {
         SCLOCK_HILOGE("ModuleInit failed!");
+        return nullptr;
     }
     return exports;
 }

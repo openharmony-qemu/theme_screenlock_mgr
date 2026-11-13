@@ -26,6 +26,7 @@
 #include "ffrt.h"
 #include "iremote_object.h"
 #include "screenlock_callback_interface.h"
+#include "screenlock_common.h"
 #include "screenlock_manager_stub.h"
 #include "screenlock_system_ability_interface.h"
 #include "system_ability.h"
@@ -115,19 +116,6 @@ enum class InteractiveState : int32_t {
     INTERACTIVE_STATE_BEGIN_WAKEUP = 1,
     INTERACTIVE_STATE_END_WAKEUP = 2,
     INTERACTIVE_STATE_BEGIN_SLEEP = 3,
-};
-
-enum class AuthState : int32_t {
-    UNAUTH = 0,
-    PRE_AUTHED_BY_CREDENTIAL = 1,
-    PRE_AUTHED_BY_FINGERPRINT = 2,
-    PRE_AUTHED_BY_FACE = 3,
-    AUTHED_BY_CREDENTIAL = 4,
-    AUTHED_BY_FINGERPRINT = 5,
-    AUTHED_BY_FACE = 6,
-    PRE_AUTHED_RESULT_BY_CREDENTIAL = 7,
-    PRE_AUTHED_RESULT_BY_FINGERPRINT = 8,
-    PRE_AUTHED_RESULT_BY_FACE = 9,
 };
 
 class ScreenLockSystemAbility : public SystemAbility, public ScreenLockManagerStub {
